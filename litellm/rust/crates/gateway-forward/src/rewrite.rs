@@ -4,9 +4,12 @@ use axum::{
     http::{HeaderMap, HeaderValue, Response, Uri, Version, header},
 };
 
-use crate::{Rejection, server::ClientSocket};
+use crate::{Rejection, client::ClientSocket};
 
 pub const PEER_HEADER: &str = "x-litellm-rust-peer";
+
+/// Who answered a response: `native`, or `python` with the reason the native app did not.
+pub const VERDICT_HEADER: &str = "x-litellm-gateway";
 
 /// The request Python receives: the client's method, target, headers and body unchanged, sent to
 /// `upstream` over HTTP/1.1 without the client connection's own headers, plus the client's TCP

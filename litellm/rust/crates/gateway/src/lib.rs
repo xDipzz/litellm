@@ -4,6 +4,7 @@ mod health;
 mod license;
 mod redis;
 mod resources;
+pub mod screen;
 mod state;
 pub use error::Error;
 pub use license::build_license;

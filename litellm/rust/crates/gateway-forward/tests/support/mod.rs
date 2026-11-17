@@ -16,7 +16,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use litellm_gateway_forward::Forward;
+use litellm_gateway_forward::Gated;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -38,13 +38,26 @@ pub async fn serve_until(
     keepalive: Duration,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> (SocketAddr, JoinHandle<()>) {
-    let forward = Forward::new(&format!("http://{upstream}").parse().unwrap(), keepalive);
     let public = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = public.local_addr().unwrap();
-    (
-        address,
-        tokio::spawn(forward.serve(public, shutdown, DRAIN)),
-    )
+    (address, serve_on(public, upstream, keepalive, shutdown))
+}
+
+/// Like [`serve_until`], on a listener the test bound itself.
+pub fn serve_on(
+    public: TcpListener,
+    upstream: SocketAddr,
+    keepalive: Duration,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> JoinHandle<()> {
+    tokio::spawn(litellm_gateway_forward::serve(
+        public,
+        format!("http://{upstream}").parse().unwrap(),
+        keepalive,
+        DRAIN,
+        Gated::from,
+        shutdown,
+    ))
 }
 
 /// A running forwarder in front of `upstream`, listening on a real socket like production.

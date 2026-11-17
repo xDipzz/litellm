@@ -1,29 +1,53 @@
 # Forwarding gateway
 
-`Forward` is a reverse proxy in front of the Python proxy on loopback. Python must see each request as if the client had connected to it directly, because every Python route (inference, MCP, pass-through, UI, WebSocket) is served behind it without Rust knowing which one it is
+`Forward` is a reverse proxy in front of the Python proxy on loopback. Python must see each request as if the client had connected to it directly, because it serves every route behind Rust without Rust knowing which one
 
-- Serve HTTP/1.1 only, as uvicorn does. The supervisor never puts Rust in front of a Python server that speaks HTTP/2
-- Never branch on a route or path. A behavior one endpoint needs is a protocol behavior every endpoint gets
-- Forward the method, request target, headers, and body byte for byte within the [URL contract](FORWARDING.md#url-fragments-and-literal-hashes). An unescaped `#` starts a fragment and is omitted with everything after it, while `%23` is preserved. Only drop hop-by-hop headers (RFC 9110 section 7.6.1) and set `x-litellm-rust-peer`, which replaces any client copy
-- Stream both bodies. Never buffer, cap, or time out a body, since uploads and provider streams have no upper bound
-- A client disconnect closes the upstream connection at every stage, because that is how Python learns to stop a provider stream
-- An upstream that dies mid-response fails the client body. Never end it cleanly, or SSE clients treat a truncated stream as complete
+## Rules
+
+### What Python and the client receive
+
+- Forward the method, target, headers and body byte for byte within the [URL contract](FORWARDING.md#url-fragments-and-literal-hashes). Only drop hop-by-hop headers (RFC 9110 section 7.6.1) and set `x-litellm-rust-peer`, which replaces any client copy
 - Never invent a Host. Python builds absolute URLs from it, so a missing one must never become the private upstream address
 - A request Python could not have received unchanged (HTTP/1.1 without Host, a transfer coding other than chunked, a target without a path) gets the status uvicorn would have given, from Rust
-- Pooled upstream connections are retired well before Python's keep-alive timeout, so a request never lands on a connection Python is closing
-- Idle client connections close after Python's keep-alive timeout, as uvicorn closed them, so a client that vanishes cannot hold a socket forever. Only the wait for the next request is timed, never an exchange in progress
-- WebSocket is the one protocol switch Python serves. Upgrades are relayed as raw bytes after the 101 and drained on shutdown
-- Drain on EOF of stdin exactly as on SIGTERM. The supervisor holds the only write end, so EOF means it is gone and nobody is left to stop the gateway. `input_closed` reads on a plain thread, since a read blocked on tokio's blocking pool would hold up the runtime's exit
+- Stream both bodies. Never buffer, cap or time out a body, since uploads and provider streams have no upper bound
+- An upstream that dies mid-response fails the client body. A clean end would make SSE clients treat a truncated stream as complete
+- A client disconnect closes the upstream connection at every stage, which is how Python learns to stop a provider stream
+
+### Connections
+
+- Serve HTTP/1.1 only, as uvicorn does. WebSocket is the one protocol switch, relayed as raw bytes after the 101 and drained on shutdown
+- Retire pooled upstream connections well before Python's keep-alive timeout, so no request lands on one Python is closing
+- Close idle client connections after Python's keep-alive timeout, as uvicorn did. Time only the wait for the next request, never an exchange in progress
+- Drain on EOF of stdin exactly as on SIGTERM, since the supervisor holds the only write end. `input_closed` reads on a plain thread, because a read blocked on tokio's blocking pool would hold up the runtime's exit
+
+### The native app
+
+- Never branch on a route or path. A behavior one endpoint needs is a protocol behavior every endpoint gets
+- Take the native app as any tower `Service`, never as an axum `Router`, and never match a route, attach a route layer or install a fallback. The caller's screen sees every request first and is the only thing that decides who answers, so no request Python answers passes through a native layer
+- `behind` returns a `Gated` that only `run` and `serve` take, so callers put every layer on the native app before handing it over. `x-litellm-gateway` on the response names who answered and why
 
 ## Layout
 
-Every forwarding decision has one home. `rewrite.rs` owns what Python and the client receive, as pure functions over requests and responses. `Rejection` in `error.rs` is the only place that picks a status for a request Rust answers itself. `settings.rs` parses the environment into typed values, so an `Upstream` is a loopback origin by construction. `server.rs` accepts client connections and owns their timeouts, since `axum::serve` exposes none, and `connections.rs` tracks every connection and relay for shutdown. `forward.rs` and `websocket.rs` only move requests, bodies and upgraded connections and never touch a header themselves. `connector.rs` keeps hyper reading Python's answer after Python stops reading the request
+Every decision has one home
+
+| File | Owns |
+|---|---|
+| `lib.rs` | The only wiring. `serve` creates the `Connections` and hands a clone to `Forward` and to `server::serve`, and nothing else starts a server |
+| `server.rs` | Accepting client connections and their timeouts, which `axum::serve` does not expose |
+| `connections.rs` | Every connection and relay, and the shutdown sequence from draining to closing what outlives the drain |
+| `client.rs` | `ClientSocket`, which the serving loop puts in each request's extensions, and the one function that reads it back |
+| `forward.rs`, `websocket.rs` | Moving requests, bodies and upgraded connections, never touching a header. `Forward` is only the leaf service that relays to Python |
+| `rewrite.rs` | What Python and the client receive, as pure functions over requests and responses |
+| `error.rs` | `Rejection`, the only place that picks a status for a request Rust answers itself |
+| `gate.rs` | `Forward::behind`, which puts the screen in front of the native app |
+| `connector.rs` | Keeping hyper reading Python's answer after Python stops reading the request |
+| `settings.rs` | Parsing the environment into typed values, so an `Upstream` is a loopback origin by construction |
 
 ## Environment
 
-`Settings` reads only these variables, and only when `LITELLM_FORWARD_UPSTREAM` is set. The Python supervisor in `litellm/proxy/rust_forward/` sets every one of them from the values Python actually runs with, so all of them are required and a missing or invalid one fails startup naming it. The crate never reads Python's own settings (`HOST`, `PORT`, `KEEPALIVE_TIMEOUT`, `GRACEFUL_SHUTDOWN_TIMEOUT`) and keeps no copy of Python's defaults, since Python can get those values from CLI flags the environment never shows
+Only the Python supervisor in `litellm/proxy/rust_forward/` starts forwarding mode, from `litellm` and from `python -m gateway.launch`. `supervisor/children.py` is the only writer of these variables, so adding, renaming or removing one changes `settings.rs` and `children.rust_spec` in the same change. Every variable is required, and a missing or invalid one fails startup naming it. Without `LITELLM_FORWARD_UPSTREAM` the binary runs as the standalone Rust gateway and this crate does nothing
 
-Only the Python supervisor starts the gateway in forwarding mode, from `litellm` and from `python -m gateway.launch`, on a laptop and in every image. `supervisor/children.py` is the only writer of these variables, so adding, renaming or removing one changes `settings.rs` and `children.rust_spec` in the same change. Without `LITELLM_FORWARD_UPSTREAM` the binary runs as the standalone Rust gateway and this crate does nothing
+Never read Python's own settings (`HOST`, `PORT`, `KEEPALIVE_TIMEOUT`, `GRACEFUL_SHUTDOWN_TIMEOUT`) or keep a copy of its defaults, since Python can take those from CLI flags the environment never shows
 
 | Variable | Meaning |
 |---|---|
@@ -35,6 +59,16 @@ Only the Python supervisor starts the gateway in forwarding mode, from `litellm`
 
 ## Tests
 
-Test through real sockets with `tests/support`, never `oneshot`. `Gateway` runs the forwarder on a listener like production, `recording` is a well-behaved upstream that captures what Python would receive, and `raw_upstream` and `Raw` drive bytes by hand for framing, timing and disconnects a real server would not produce. Waits measured in minutes use paused tokio time instead of real sleeps
+Test through real sockets with `tests/support`, never `oneshot`. `Gateway` runs the forwarder on a listener like production, `recording` is a well-behaved upstream that captures what Python would receive, and `raw_upstream` and `Raw` drive bytes by hand for framing, timing and disconnects a real server would not produce. Waits measured in minutes use paused tokio time
 
-The forwarder sees HTTP/1.1 messages, not routes, so the tests are split into one file per traffic shape uvicorn can emit: `exchange` (plain request and response), `framing` (requests whose framing a parser could read two ways), `slow_head` (minutes before response headers), `stream` (incremental response bodies), `idle_stream` (long-lived streams that go quiet), `upload`, `download`, `websocket`, `client_identity`, `lifecycle` (disconnects, pooling, idle timeouts, shutdown) and `roundtrip` (the forwarding invariant for generated messages). A new route never gets its own test. Add its behavior to the shape it already has, and when it needs a wire behavior none of the files covers, add a new shape file for it
+The forwarder sees HTTP/1.1 messages, so there is one test file per traffic shape uvicorn can emit and never one per route. Add a route's behavior to the shape it already has, and add a new shape file only for a wire behavior none of them covers
+
+| File | Shape |
+|---|---|
+| `exchange` | plain request and response |
+| `framing` | requests whose framing a parser could read two ways |
+| `slow_head` | minutes before response headers |
+| `stream`, `idle_stream` | incremental response bodies, and long-lived streams that go quiet |
+| `upload`, `download`, `websocket`, `client_identity` | as named |
+| `lifecycle` | disconnects, pooling, idle timeouts, shutdown |
+| `roundtrip` | the forwarding invariant for generated messages |

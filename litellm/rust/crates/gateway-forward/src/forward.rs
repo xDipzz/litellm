@@ -1,4 +1,5 @@
 use std::{
+    convert::Infallible,
     pin::Pin,
     task::{Context, Poll},
     time::Duration,
@@ -15,11 +16,11 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::{TokioExecutor, TokioTimer},
 };
-use tokio::net::TcpListener;
+use tower::Service;
 
 use crate::{
-    Rejection, Upstream, connections::Connections, connector::Connector, rewrite, server,
-    server::ClientSocket, websocket,
+    Rejection, Upstream, client::ClientSocket, connections::Connections, connector::Connector,
+    rewrite, websocket,
 };
 
 // h11 counts no headers and only caps a head at 16 KiB, so it accepts as many headers as fit in
@@ -32,14 +33,17 @@ pub struct Forward {
     upstream: Uri,
     client: Client<Connector, Body>,
     connections: Connections,
-    keepalive: Duration,
 }
 
 impl Forward {
     /// `upstream_keepalive` is how long the upstream keeps an idle connection open. Pooled
-    /// connections are dropped well before that, so a request never lands on one it is closing,
-    /// and idle client connections are closed after it, as uvicorn did.
-    pub fn new(upstream: &Upstream, upstream_keepalive: Duration) -> Self {
+    /// connections are dropped well before that, so a request never lands on one it is closing.
+    /// WebSocket relays run on `connections`, so shutdown drains them with the client connections.
+    pub(crate) fn new(
+        upstream: &Upstream,
+        upstream_keepalive: Duration,
+        connections: Connections,
+    ) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_nodelay(true);
         let client = Client::builder(TokioExecutor::new())
@@ -51,42 +55,12 @@ impl Forward {
         Self {
             upstream: upstream.uri().clone(),
             client,
-            connections: Connections::default(),
-            keepalive: upstream_keepalive,
+            connections,
         }
     }
 
-    /// Serves until `shutdown` resolves, then lets open requests and WebSockets finish for up to
-    /// `drain` before closing whatever is left. Python shuts down alongside and ends long streams
-    /// itself, so `drain` only backstops a Python that never does.
-    pub async fn serve(
-        self,
-        listener: TcpListener,
-        shutdown: impl Future<Output = ()>,
-        drain: Duration,
-    ) {
-        server::serve(self, listener, shutdown, drain).await;
-    }
-
-    pub(crate) fn connections(&self) -> &Connections {
-        &self.connections
-    }
-
-    pub(crate) fn keepalive(&self) -> Duration {
-        self.keepalive
-    }
-
-    pub(crate) async fn handle(&self, client: ClientSocket, request: Request) -> Response {
-        self.forward(client, request)
-            .await
-            .unwrap_or_else(IntoResponse::into_response)
-    }
-
-    async fn forward(
-        &self,
-        client: ClientSocket,
-        mut request: Request,
-    ) -> Result<Response, Rejection> {
+    async fn relay(&self, mut request: Request) -> Result<Response, Rejection> {
+        let client = ClientSocket::of(&request)?;
         if let Some(downstream) = websocket::take_handshake(&self.connections, &mut request)? {
             return self.forward_websocket(client, request, downstream).await;
         }
@@ -116,6 +90,28 @@ impl Forward {
             return websocket::switch(&self.connections, downstream, response).await;
         }
         http_response(response)
+    }
+}
+
+/// Relays each request to Python, which sees it as the client sent it. The serving loop puts the
+/// client's socket in the request extensions, as axum's `ConnectInfo` does.
+impl Service<Request> for Forward {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Response, Infallible>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let forward = self.clone();
+        Box::pin(async move {
+            Ok(forward
+                .relay(request)
+                .await
+                .unwrap_or_else(IntoResponse::into_response))
+        })
     }
 }
 
