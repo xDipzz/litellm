@@ -36,6 +36,8 @@ mod _native {
         jwt_unverified_claims,
     };
     #[pymodule_export]
+    use crate::auth::{RequestBodyNames, check_request_body};
+    #[pymodule_export]
     use crate::auth::{
         auth_allowed_routes_grant, auth_first_denied_route, auth_jwt_team_routes_grant,
         auth_managed_agent_route_allowed, auth_managed_route, auth_route_matches_denied,
@@ -233,6 +235,8 @@ mod tests {
                 "NativeBudgets",
                 "budget_check_decision",
                 "NativeS3Log",
+                "RequestBodyNames",
+                "check_request_body",
                 "auth_allowed_routes_grant",
                 "auth_first_denied_route",
                 "auth_jwt_team_routes_grant",
