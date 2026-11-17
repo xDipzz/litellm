@@ -1,8 +1,6 @@
 use axum::http::StatusCode;
-use axum::{
-    Json,
-    response::{IntoResponse, Response},
-};
+use axum::response::{IntoResponse, Response};
+use litellm_gateway_error::RouteError;
 use litellm_inference::Error as InferenceError;
 use litellm_llms::base_llm::ocr::error::Error as OcrError;
 use serde_json::{Map, Value, json};
@@ -82,8 +80,9 @@ impl Error {
         }
     }
 
+    /// The OpenAI envelope, which the gateway swaps for the Anthropic one on Anthropic routes.
     pub fn openai_response(self) -> Response {
-        (self.status(), Json(self.openai_body())).into_response()
+        RouteError::new(self.status(), self.message(), self.openai_body()).into_response()
     }
 
     /// The OpenAI envelope as an `event: error` frame, for a stream that fails after its

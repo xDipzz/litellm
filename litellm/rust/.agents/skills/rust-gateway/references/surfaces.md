@@ -7,7 +7,8 @@ Each surface mirrors what the Python proxy returns there, so the shapes differ o
 | `/v1/messages` | Anthropic, `{"type": "error", "error": {"type", "message"}, "request_id"}` | `Error::body()` and `sse_frame()` in `crates/gateway-inference/src/error.rs` |
 | OpenAI-shaped routes | `{"error": {"message", "type", "param", "code"}}` | `Error::openai_response()` in the same file |
 | `/v1/responses` stream | the Responses `error` event, `{"type": "error", "code", "message", "param"}` | `Error::responses_sse_frame()` in the same file |
-| auth rejections | plain text, the top-level message only | `crates/gateway-auth/src/error.rs` |
+| auth rejections | the proxy's `ProxyException` body, `{"error": {"message", "type": "auth_error", "param", "code"}}`, the top-level message only | `crates/gateway-auth/src/error.rs` |
+| middleware rejections and any `RouteError` | the Anthropic envelope on Anthropic routes, the caller's OpenAI body elsewhere | `crates/gateway-error`, swapped by `crates/gateway/src/middleware/route_error.rs` |
 
 Every surface takes its status from one `status()` on its crate's `Error` and renders the message of anything that is not a provider answer with `litellm_error::Report`. In `gateway-inference` the error `type` string is derived from the status by `error_type()`, so a new failure never names its own type. The Anthropic envelope passes a provider body already in its shape through untouched and extracts the message from anything else, and the OpenAI envelope always wraps, as the Python proxy does. A provider body is bounded by `litellm_http::Error::upstream` when the error is built
 

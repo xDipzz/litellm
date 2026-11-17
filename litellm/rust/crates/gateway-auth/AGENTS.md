@@ -18,7 +18,7 @@ Authentication evidence and principals contain no raw token, password, request b
 
 Failures distinguish invalid or expired credentials, forbidden operations, unavailable authentication services, and missing server configuration/context. Bearer tokens and virtual keys all fail with the one `Error`, classified once by `status()`, and `is_denied()` tells a rejected caller from an auth failure. Inference keeps its API-specific error envelopes
 
-The plain-text rejection body is the top-level message only, never the `Report` chain, because the caller is unauthenticated and the sources carry secret-manager and backend detail. That stays reachable through `source()` for logs
+The rejection body, the proxy's `ProxyException` JSON with type `auth_error`, carries the top-level message only, never the `Report` chain, because the caller is unauthenticated and the sources carry secret-manager and backend detail. That stays reachable through `source()` for logs
 
 Virtual-key storage, JWT verification, OAuth2 introspection, trusted-proxy validation, SSO, and custom Python hook adapters are not implemented here yet. They should supply these contracts rather than bypassing the shared authorization boundary. Request-body-dependent custom hooks will need a bounded endpoint adapter after parsing
 

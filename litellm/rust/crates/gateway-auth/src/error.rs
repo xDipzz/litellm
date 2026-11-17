@@ -3,6 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use litellm_error::Source;
+use litellm_gateway_error::RouteError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -40,7 +41,7 @@ impl Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.status(), self.to_string()).into_response()
+        RouteError::proxy_exception(self.status(), self.to_string(), "auth_error").into_response()
     }
 }
 
@@ -49,6 +50,25 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[tokio::test]
+    async fn a_rejection_is_a_proxy_auth_error() {
+        let response = Error::InvalidToken.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error": {
+                "message": "missing or invalid bearer token",
+                "type": "auth_error",
+                "param": null,
+                "code": "401",
+            }})
+        );
+    }
 
     #[rstest]
     #[tokio::test]

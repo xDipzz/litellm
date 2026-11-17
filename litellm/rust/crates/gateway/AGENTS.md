@@ -4,14 +4,14 @@
 - Inject shared state and infrastructure. Avoid global runtimes, duplicate client pools, and abstractions for hypothetical endpoint groups
 - Test mounting and server lifecycle through public HTTP behavior. Test endpoint semantics in the owning crate
 - Standalone and in front of Python serve the same native app, built by `native` in `src/main.rs`. In front of Python the only addition is `screen::screen` around all of it, so never give one mode a layer the other lacks
-- `screen::screen` is the only thing that sends a request to Python. It sees each request before any layer, and every method and path it passes must have a native route, because a request it passes that no route takes gets the native 404 and never falls back to Python
+- `screen::screen` is the only thing that sends a request to Python. It sees each request before any layer, so it matches on the client's path with the root path taken off, and every method and path it passes must have a native route, because a request it passes that no route takes gets the native 404 and never falls back to Python
 
 ## Resources
 - `Resources::build` (`src/resources.rs`) makes what every part is built from, once per config: the environment (the config's `environment_variables` in front of the process environment), the `SecretResolver` over it, the HTTP client config and the inference `CoreResources` with the client pool. Inference, Redis and the database each take what they need from it. Never reach into one part for another part's pool, config or secrets, and never build a second environment overlay
 - A setting that can come from the environment, the secret manager or OIDC is read through `resources.secrets`. `resources.environment` is only for what Python reads straight from `os.environ`
 
 ## State
-- `AppState::build` (`src/state.rs`) builds `Resources` and then the stores once at boot: inference, the Redis clients and the database pools. `router` takes it and hands it to routes with `with_state`, and a handler or middleware takes the part it needs with `State<RedisClients>` or `State<Option<Pools>>`, which `FromRef` clones out of it. Never build a store inside a route and never give one mode a store the other lacks
+- `AppState::build` (`src/state.rs`) builds `Resources` and then what both modes share once at boot: inference, the Redis clients and the database pools. `router` takes it and hands it to routes with `with_state`, and a handler or middleware takes the part it needs with `State<RedisClients>` or `State<Option<Pools>>`, which `FromRef` clones out of it. Never build a store inside a route and never give one mode a store the other lacks
 - In front of Python the config is still `Config::default()`, so only the environment's `REDIS_*` and `DATABASE_*` are seen there until #52003
 
 ## Redis
@@ -28,6 +28,6 @@
 - `/health/readiness` pings the writer for up to 2s and reports `connected`, `disconnected`, or `Not connected` when no database is configured, and always answers 200. The proxy's 503 on `disconnected` without `allow_requests_on_db_unavailable` and its 15s cache of a good answer are not ported
 
 ## License
-- `build_license` verifies the license once at boot (`src/license.rs`) and the result never changes while serving. For now both modes only log whether it is enterprise
+- `build_license` verifies the license once at boot (`src/license.rs`) and the result never changes while serving. `middleware::global` hands it to every middleware and route as `Extension<Arc<Entitlements>>`
 - The key comes from `LITELLM_LICENSE`, where config `environment_variables` replaces the process environment, and from `general_settings.litellm_license`, which wins unless only the environment's key is enterprise, as in `_use_config_license`
 - Verification itself belongs to `litellm-license`. A key the bundled public key did not sign is asked of the license server, so boot can wait on that request for `NON_LLM_CONNECTION_TIMEOUT` seconds per attempt

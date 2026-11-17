@@ -63,6 +63,7 @@ litellm-env = { path = "crates/env" }
 litellm-yaml = { path = "crates/yaml" }
 litellm-db = { path = "crates/db" }
 litellm-db-resolve = { path = "crates/db-resolve" }
+litellm-gateway-error = { path = "crates/gateway-error" }
 litellm-license = { path = "crates/license" }
 litellm-db-testing = { path = "crates/db-testing" }
 litellm-cache = { path = "crates/cache" }
