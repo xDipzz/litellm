@@ -57,6 +57,18 @@ impl CallerValue {
         self.text()
             .is_some_and(|text| text.starts_with(OIDC_REFERENCE_PREFIX))
     }
+
+    /// Whether a secret reference sits here or anywhere below.
+    pub(crate) fn holds_secret_reference(&self) -> bool {
+        match self {
+            Self::Text(_) => self.is_secret_reference(),
+            Self::List(items) => items.iter().any(Self::holds_secret_reference),
+            Self::Map(params) => params
+                .iter()
+                .any(|(_, value)| value.holds_secret_reference()),
+            Self::Null | Self::Other => false,
+        }
+    }
 }
 
 /// Shows the shape alone, since a caller's own credential may sit in the text.
@@ -136,6 +148,20 @@ mod tests {
     #[case::other_case("OS.ENVIRON/HOME", false)]
     fn a_string_is_a_secret_reference_only_by_prefix(#[case] value: &str, #[case] expected: bool) {
         assert_eq!(text(value).is_secret_reference(), expected);
+    }
+
+    #[rstest]
+    #[case::in_a_list(CallerValue::List(vec![text("plain"), text("oidc/google/aud")]), true)]
+    #[case::in_a_nested_map(
+        CallerValue::Map(Params::from_iter([(
+            "parameters".to_owned(),
+            CallerValue::Map(Params::from_iter([("key".to_owned(), text("os.environ/KEY"))])),
+        )])),
+        true
+    )]
+    #[case::nowhere(CallerValue::List(vec![text("plain"), CallerValue::Other]), false)]
+    fn a_reference_is_found_at_any_depth(#[case] value: CallerValue, #[case] expected: bool) {
+        assert_eq!(value.holds_secret_reference(), expected);
     }
 
     #[test]

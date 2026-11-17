@@ -102,7 +102,7 @@ pub(crate) fn check_request_body<'py>(
 ) -> PyResult<Option<String>> {
     let module = body.py().import(MODULE)?;
     let surface = Surface::of(route);
-    let params = root(body, &names.get().0)?;
+    let params = root(body, &names.get().0, &surface)?;
     let fallback_targets = fallback_targets
         .iter()
         .map(|target| read(target, 0))
@@ -135,12 +135,12 @@ pub(crate) fn check_request_body<'py>(
     }
 }
 
-fn root(body: &Bound<'_, PyAny>, names: &Names) -> PyResult<Params> {
+fn root(body: &Bound<'_, PyAny>, names: &Names, surface: &Surface) -> PyResult<Params> {
     entries(body)?
         .into_iter()
         .filter_map(|(key, entry)| {
             let key = text(&key)?;
-            let entry = match names.reading(&key) {
+            let entry = match names.reading(surface, &key) {
                 Reading::Unread => Ok(CallerValue::Other),
                 Reading::Shallow => Ok(shallow(&entry)),
                 Reading::Deep => read(&entry, 0),

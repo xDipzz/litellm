@@ -8,8 +8,8 @@ use super::{
     grant::{MAX_FALLBACK_MODELS, Reachable},
     host::Host,
     names::{
-        API_KEY, BUCKET_PARAMS, CREDENTIAL_NAME, METADATA_KEYS, NESTED_CONFIG_KEYS, Names,
-        VERTEX_TARGET_PARAMS,
+        API_KEY, BUCKET_PARAMS, CREDENTIAL_NAME, FALLBACK_FIELDS, METADATA_KEYS,
+        NESTED_CONFIG_KEYS, Names, VERTEX_TARGET_PARAMS, is_content_key, is_metadata_key,
     },
     policy::{Deferred, Policy, allowlist},
     surface::Surface,
@@ -18,6 +18,7 @@ use super::{
 use crate::error::body::{Rejection, ServerOwnedKind};
 
 const USER_CONFIG: &str = "user_config";
+const ROUTER_SETTINGS_OVERRIDE: &str = "router_settings_override";
 const LITELLM_PARAMS: &str = "litellm_params";
 
 /// One request body and what its route and caller say about it.
@@ -135,6 +136,9 @@ impl<H: Host> Check<'_, H> {
         self.user_config_federation()?;
         self.litellm_params()?;
         self.user_config_secret_references()?;
+        if surface.model_call && !surface.manages_deployments {
+            self.unlisted_secret_references()?;
+        }
         Ok(())
     }
 
@@ -404,6 +408,45 @@ impl<H: Host> Check<'_, H> {
         Ok(())
     }
 
+    /// Every key of a model call outside its content can reach a provider as a parameter, and
+    /// providers resolve references in more parameters than any list names. So a reference
+    /// anywhere a parameter can sit is refused, listed or not.
+    fn unlisted_secret_references(&self) -> Checked<H::Error> {
+        let request = self.request;
+        for (key, value) in request.body.iter() {
+            if is_content_key(key)
+                || is_metadata_key(key)
+                || NESTED_CONFIG_KEYS.contains(&key)
+                || FALLBACK_FIELDS.contains(&key)
+                || key == USER_CONFIG
+            {
+                continue;
+            }
+            let holds = match (key, value.map()) {
+                (ROUTER_SETTINGS_OVERRIDE, Some(settings)) => {
+                    holds_outside(settings, |name| FALLBACK_FIELDS.contains(&name))
+                }
+                (LITELLM_PARAMS, Some(params)) => holds_outside(params, is_metadata_key),
+                _ => value.holds_secret_reference(),
+            };
+            if holds {
+                return Err(secret_reference(key).into());
+            }
+        }
+        for config in self.nested_configs(request.body)? {
+            first_holding_secret_reference(&config)?;
+        }
+        for target in request.fallback_targets.iter().filter_map(CallerValue::map) {
+            first_holding_secret_reference(target)?;
+        }
+        // A caller-supplied router resolves references in its own settings, not only in its
+        // deployments.
+        if let Some(config) = self.mapping(request.body.get(USER_CONFIG))? {
+            first_holding_secret_reference(&config)?;
+        }
+        Ok(())
+    }
+
     fn nested_configs<'v>(
         &self,
         params: &'v Params,
@@ -478,6 +521,23 @@ fn first_secret_reference(params: &Params, reads: impl Fn(&str) -> bool) -> Resu
         Some((param, _)) => Err(secret_reference(param)),
         None => Ok(()),
     }
+}
+
+fn first_holding_secret_reference(params: &Params) -> Result<(), Rejection> {
+    match params
+        .iter()
+        .find(|(_, value)| value.holds_secret_reference())
+    {
+        Some((param, _)) => Err(secret_reference(param)),
+        None => Ok(()),
+    }
+}
+
+/// Whether a reference sits below any entry `skipped` does not name.
+fn holds_outside(params: &Params, skipped: impl Fn(&str) -> bool) -> bool {
+    params
+        .iter()
+        .any(|(name, value)| !skipped(name) && value.holds_secret_reference())
 }
 
 fn fallback_model(target: &CallerValue) -> Option<&str> {
@@ -878,10 +938,82 @@ mod tests {
     }
 
     #[rstest]
+    #[case::unlisted_param(json!({"model": "gpt-4o", "some_provider_param": "os.environ/LITELLM_MASTER_KEY"}), "some_provider_param")]
+    #[case::below_an_unlisted_param(
+        json!({"model": "gpt-4o", "provider_options": {"auth": ["plain", {"token": "oidc/env/LITELLM_MASTER_KEY"}]}}),
+        "provider_options"
+    )]
+    #[case::unlisted_param_in_extra_body(json!({"model": "gpt-4o", "extra_body": {"some_provider_param": "os.environ/HOME"}}), "some_provider_param")]
+    #[case::below_litellm_params(json!({"model": "gpt-4o", "litellm_params": {"anything": "os.environ/HOME"}}), "litellm_params")]
+    #[case::below_router_settings(json!({"model": "gpt-4o", "router_settings_override": {"timeout": "os.environ/HOME"}}), "router_settings_override")]
+    fn a_model_call_carries_no_secret_reference_outside_its_content(
+        names: Names,
+        #[case] body: Value,
+        #[case] param: &str,
+    ) {
+        assert_eq!(open(body).run(&names), reference(param));
+    }
+
+    #[rstest]
+    #[case::connection_setting(json!({"redis_password": "os.environ/LITELLM_MASTER_KEY"}), "redis_password")]
+    #[case::below_a_setting(json!({"cache_kwargs": {"password": "oidc/env/LITELLM_MASTER_KEY"}}), "cache_kwargs")]
+    #[case::beside_a_deployment(
+        json!({
+            "model_list": [{"litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-own"}}],
+            "redis_url": "os.environ/LITELLM_MASTER_KEY",
+        }),
+        "redis_url"
+    )]
+    #[case::sent_as_text(json!("{\"redis_password\": \"os.environ/LITELLM_MASTER_KEY\"}"), "redis_password")]
+    fn a_caller_supplied_router_carries_no_secret_reference_in_any_setting(
+        names: Names,
+        #[case] user_config: Value,
+        #[case] param: &str,
+    ) {
+        let case = open(json!({"model": "caller-model", "user_config": user_config}));
+
+        assert_eq!(case.run(&names), reference(param));
+    }
+
+    #[rstest]
+    fn a_caller_supplied_router_may_carry_the_callers_own_settings(names: Names) {
+        let case = open(json!({
+            "model": "caller-model",
+            "user_config": {
+                "model_list": [{"litellm_params": {"model": "openai/gpt-4o", "api_key": "sk-own"}}],
+                "redis_host": "cache.own.example",
+                "redis_password": "own-password",
+            },
+        }));
+
+        assert_eq!(case.run(&names), Ok(()));
+    }
+
+    #[rstest]
+    fn a_fallback_target_carries_no_secret_reference_in_any_param(names: Names) {
+        let case = Case {
+            fallback_targets: json!([{"model": "gpt-4o", "some_provider_param": "os.environ/HOME"}]),
+            ..open(json!({"model": "gpt-4o"}))
+        };
+
+        assert_eq!(case.run(&names), reference("some_provider_param"));
+    }
+
+    #[rstest]
     #[case::prompt(open(json!({"model": "gpt-4o", "prompt": "os.environ/PATH is what in Python?"})))]
+    #[case::message(open(json!({"model": "gpt-4o", "messages": [{"role": "user", "content": "os.environ/HOME"}]})))]
+    #[case::tool_schema(open(json!({"model": "gpt-4o", "tools": [{"function": {"parameters": {"default": "os.environ/OPENAI_API_KEY"}}}]})))]
     #[case::metadata_tag(open(json!({"model": "gpt-4o", "metadata": {"client_id": "os.environ/HOME", "note": "oidc/azure/team-a"}})))]
+    #[case::litellm_params_metadata_tag(open(json!({"model": "gpt-4o", "litellm_params": {"metadata": {"note": "os.environ/HOME"}}})))]
     #[case::mentioned_later(open(json!({"model": "gpt-4o", "client_id": "read os.environ/HOME"})))]
+    #[case::mentioned_later_in_an_unlisted_param(open(json!({"model": "gpt-4o", "some_provider_param": "read os.environ/HOME"})))]
     #[case::callers_own_key(open(json!({"model": "gpt-4o", "api_key": "sk-caller-own-key"})))]
+    #[case::fallback_model_name(open(json!({"model": "gpt-4o", "fallbacks": ["os.environ/HOME"]})))]
+    #[case::fallback_model_name_in_router_settings(
+        open(json!({"model": "gpt-4o", "router_settings_override": {"fallbacks": [{"gpt-4o": ["os.environ/HOME"]}]}}))
+    )]
+    #[case::key_management_route(on("/key/generate", json!({"key_alias": "os.environ/HOME"})))]
+    #[case::credential_route(on("/credentials", json!({"credential_values": {"api_key": "os.environ/AZURE_API_KEY"}})))]
     fn text_that_no_provider_resolves_may_look_like_a_secret_reference(
         names: Names,
         #[case] case: Case<'static>,
