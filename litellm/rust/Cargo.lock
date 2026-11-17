@@ -3220,6 +3220,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-link",
 ]
 
 [[package]]
@@ -3805,6 +3806,7 @@ dependencies = [
 name = "litellm-config"
 version = "0.1.0"
 dependencies = [
+ "envy",
  "litellm-python-compat",
  "litellm-router-types",
  "litellm-secret-value",
@@ -3993,6 +3995,7 @@ dependencies = [
  "litellm-gateway-inference",
  "litellm-http",
  "litellm-inference",
+ "litellm-license",
  "litellm-llms",
  "litellm-model-catalog",
  "litellm-python-compat",
@@ -4401,6 +4404,27 @@ dependencies = [
  "litellm-tracing",
  "rstest",
  "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "litellm-license"
+version = "0.1.0"
+dependencies = [
+ "backon",
+ "base64 0.22.1",
+ "jiff",
+ "litellm-error",
+ "litellm-http",
+ "rand 0.8.7",
+ "rsa",
+ "rstest",
+ "serde_json",
+ "sha2 0.10.9",
+ "strum",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "wiremock",
@@ -6507,6 +6531,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
+ "sha2 0.10.9",
  "signature",
  "spki",
  "subtle",
